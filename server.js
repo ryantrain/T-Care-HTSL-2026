@@ -1,0 +1,331 @@
+/**
+ * T-Care Backend — server.js
+ *
+ * Exposes two endpoints used by the frontend:
+ *
+ *   POST /api/resolve-location
+ *     Body: { query: "I need to see a counsellor" }
+ *     Returns: { address: "700 Bay Street, Toronto, ON M5G 1Z6", label: "Health & Wellness Centre", serviceKey: "health-counselling" }
+ *
+ *   GET /api/maps-key
+ *     Returns: { key: "<GOOGLE_MAPS_API_KEY>" }  (keeps the key out of the HTML source)
+ *
+ * Natural-language resolution pipeline:
+ *   1. (Optional) Query Amazon Kendra for UofT document matches → extract top result metadata
+ *   2. Call Amazon Bedrock (Claude Haiku or Titan) with the query + Kendra context
+ *      to classify intent → known campus location
+ *   3. Return resolved address + label to the frontend, which then calls
+ *      the Google Maps Directions API directly in the browser.
+ */
+
+require('dotenv').config();
+const express = require('express');
+const cors    = require('cors');
+const path    = require('path');
+const {
+  BedrockRuntimeClient,
+  ConverseCommand,
+} = require('@aws-sdk/client-bedrock-runtime');
+const {
+  KendraClient,
+  QueryCommand,
+} = require('@aws-sdk/client-kendra');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+// Serve static assets (images, css, client-side files) from the `data` folder
+app.use('/data', express.static(path.join(__dirname, 'data')));
+
+// Helper to clean env vars (removes all quotes and whitespace)
+const cleanEnv = (val) => val ? val.replace(/['"\s]/g, '') : undefined;
+
+// Manual fallback for reading .env if dotenv/process.env truncates long strings
+let manualEnv = {};
+try {
+  const fs = require('fs');
+  const raw = fs.readFileSync(path.join(__dirname, '.env'), 'utf8');
+  const regex = /^([^#\s=]+)\s*=\s*(.*)$/gm;
+  let m;
+  while ((m = regex.exec(raw)) !== null) {
+    let k = m[1];
+    let v = m[2].replace(/['"\s]/g, ''); // strip quotes/whitespace
+    manualEnv[k] = v;
+  }
+} catch (e) { console.warn('Manual .env read failed:', e.message); }
+
+// ── AWS clients ──────────────────────────────────────────────────────────────
+const awsCreds = {
+  region:      cleanEnv(process.env.AWS_REGION) || manualEnv.AWS_REGION || 'us-east-1',
+  credentials: {
+    accessKeyId:     cleanEnv(process.env.AWS_ACCESS_KEY_ID)     || manualEnv.AWS_ACCESS_KEY_ID,
+    secretAccessKey: cleanEnv(process.env.AWS_SECRET_ACCESS_KEY) || manualEnv.AWS_SECRET_ACCESS_KEY,
+    sessionToken:    cleanEnv(process.env.AWS_SESSION_TOKEN)    || manualEnv.AWS_SESSION_TOKEN,
+  },
+};
+
+// Diagnostic logging (redacted for security)
+console.log('--- AWS Diagnostic ---');
+console.log('Region:', awsCreds.region);
+console.log('AccessKeyId:', awsCreds.credentials.accessKeyId?.substring(0, 4) + '...' + awsCreds.credentials.accessKeyId?.substring(awsCreds.credentials.accessKeyId.length - 4));
+console.log('SecretKey (last 4):', '...' + awsCreds.credentials.secretAccessKey?.substring(awsCreds.credentials.secretAccessKey.length - 4));
+console.log('SessionToken length:', awsCreds.credentials.sessionToken?.length || 0);
+if (awsCreds.credentials.sessionToken) {
+  console.log('SessionToken (last 10):', '...' + awsCreds.credentials.sessionToken.substring(awsCreds.credentials.sessionToken.length - 10));
+}
+console.log('---------------------');
+
+const bedrock = new BedrockRuntimeClient(awsCreds);
+const kendra  = new KendraClient(awsCreds);
+
+// ── Known UofT campus locations ──────────────────────────────────────────────
+// These are the ground-truth addresses that get fed to Google Maps.
+const CAMPUS_LOCATIONS = {
+  'health-counselling': {
+    label:   'Health & Wellness Centre',
+    address: '700 Bay Street, Toronto, ON M5G 1Z6',
+    keywords: ['health', 'wellness', 'walk-in', 'counselling', 'sick', 'doctor', 'nurse'],
+  },
+  'counselling': {
+    label:   'Counselling',
+    address: '700 Bay Street, Toronto, ON M5G 1Z6',
+    keywords: ['therapy', 'therapist', 'mental health', 'counsellor', 'overwhelmed', 'anxious', 'depressed', 'stress'],
+  },
+  'tcard': {
+    label:   'TCard Office',
+    address: '130 St George St, Toronto, ON M5S 1A5',
+    keywords: ['tcard', 't-card', 'student card', 'id card', 'lost card'],
+  },
+  'registrar': {
+    label:   "Registrar's Office",
+    address: '172 St George St, Toronto, ON M5R 0A3',
+    keywords: ['registrar', 'transcript', 'enrolment', 'enrollment', 'verification', 'graduation', 'diploma'],
+  },
+  'aoda': {
+    label:   'Accessibility Services',
+    address: '455 Spadina Ave Suite 400, Toronto, ON M5S 2G8',
+    keywords: ['accessibility', 'accommodation', 'disability', 'aoda', 'wheelchair', 'elevator', 'ramp'],
+  },
+  'equity': {
+    label:   'Equity, Diversity & Inclusion Office',
+    address: '215 Huron St, Toronto, ON M5S 1A2',
+    keywords: ['edi', 'equity', 'diversity', 'inclusion', 'trans', 'name change', 'pronoun', 'discrimination', 'harassment'],
+  },
+  'financial': {
+    label:   'Financial Aid & Awards',
+    address: '172 St George St, Toronto, ON M5R 0A3',
+    keywords: ['financial aid', 'bursary', 'osap', 'awards', 'money', 'funding', 'scholarship', 'emergency'],
+  },
+  'robarts': {
+    label:   'Robarts Library',
+    address: '130 St George St, Toronto, ON M5S 1A5',
+    keywords: ['robarts', 'library', 'study', 'books'],
+  },
+  'harthouse': {
+    label:   'Hart House',
+    address: '7 Hart House Cir, Toronto, ON M5S 3H3',
+    keywords: ['hart house', 'gym', 'fitness', 'pool', 'athletics'],
+  },
+  'ss': {
+    label:   'Sidney Smith Hall',
+    address: '100 St George St, Toronto, ON M5S 3G3',
+    keywords: ['sidney smith', 'ss', 'sid smith'],
+  },
+  'bahen': {
+    label:   'Bahen Centre',
+    address: '40 St George St, Toronto, ON M5S 2E4',
+    keywords: ['bahen', 'cs', 'computer science', 'engineering'],
+  },
+  'med': {
+    label:   'Medical Sciences Building',
+    address: '1 King\'s College Cir, Toronto, ON M5S 1A8',
+    keywords: ['medical sciences', 'med sci', 'king\'s college circle'],
+  },
+  'simcoe': {
+    label:   "Simcoe Hall",
+    address: '27 King\'s College Cir, Toronto, ON M5S 1A1',
+    keywords: ['simcoe', 'president', 'admin', 'administrative'],
+  },
+};
+
+// ── Step 1: Optional Kendra query ────────────────────────────────────────────
+async function queryKendra(userQuery) {
+  const indexId = process.env.KENDRA_INDEX_ID;
+  if (!indexId) return null; // Kendra not configured — skip
+
+  try {
+    const cmd = new QueryCommand({
+      IndexId:     indexId,
+      QueryText:   userQuery,
+      PageSize:    3,
+    });
+    const res = await kendra.send(cmd);
+    const items = res.ResultItems || [];
+    // Extract any location metadata attributes from the top result
+    const top = items[0];
+    if (!top) return null;
+    const attrs = (top.DocumentAttributes || []).reduce((acc, a) => {
+      acc[a.Key] = a.Value?.StringValue || a.Value?.LongValue;
+      return acc;
+    }, {});
+    return {
+      excerpt: top.DocumentExcerpt?.Text || '',
+      attrs,
+    };
+  } catch (err) {
+    console.warn('Kendra query failed (non-fatal):', err.message);
+    return null;
+  }
+}
+
+// ── Step 2: Bedrock NLP ───────────────────────────────────────────────────────
+async function resolveWithBedrock(userQuery, kendraContext) {
+  const locationList = Object.entries(CAMPUS_LOCATIONS)
+    .map(([key, v]) => `"${key}": ${v.label} at ${v.address}`)
+    .join('\n');
+
+  const contextBlock = kendraContext
+    ? `\nRelevant UofT document context (from Kendra):\n"${kendraContext.excerpt}"\n`
+    : '';
+
+  const systemPrompt = `You are a UofT campus location resolver. A student has described their need or destination. Your job is to identify the single most relevant campus location from the list below and return it as JSON.
+
+Known locations:
+${locationList}
+${contextBlock}
+
+Rules:
+- Return ONLY valid JSON, no other text or markdown.
+- If the input is a physical place name, match it directly.
+- If the input describes a need or service (e.g. "I need therapy", "lost my TCard"), infer the correct location.
+- If nothing matches, use "health-counselling" as a safe default.
+- isPhysicalLocation should be true if the request relates to a physical place or service with a campus address, false if it's purely informational (e.g. "what is OSAP?").
+
+Response format:
+{"key":"<location_key>","label":"<location label>","address":"<full address>","isPhysicalLocation":true}
+
+Student input: "${userQuery}"`;
+
+  const modelId = process.env.BEDROCK_MODEL_ID || 'amazon.nova-micro-v1:0';
+
+  const cmd = new ConverseCommand({
+    modelId,
+    messages: [{ role: 'user', content: [{ text: systemPrompt }] }],
+    inferenceConfig: { maxTokens: 200, temperature: 0 },
+  });
+
+  const res = await bedrock.send(cmd);
+  const raw = res.output.message.content[0].text;
+
+  // Strip any accidental markdown fences
+  const clean = raw.replace(/```json|```/g, '').trim();
+  return JSON.parse(clean);
+}
+
+// ── /api/resolve-location ─────────────────────────────────────────────────────
+app.post('/api/resolve-location', async (req, res) => {
+  const { query } = req.body;
+  if (!query || typeof query !== 'string') {
+    return res.status(400).json({ error: 'query is required' });
+  }
+
+  try {
+    // 1. Kendra (optional)
+    const kendraResult = await queryKendra(query);
+
+    // 2. Bedrock
+    const resolved = await resolveWithBedrock(query, kendraResult);
+
+    return res.json({
+      key:                resolved.key,
+      label:              resolved.label,
+      address:            resolved.address,
+      isPhysicalLocation: resolved.isPhysicalLocation !== false,
+    });
+  } catch (err) {
+    console.error('resolve-location error:', err);
+
+    // Graceful fallback: simple keyword match so the UI never hard-fails
+    const q = query.toLowerCase();
+    let fallback = CAMPUS_LOCATIONS['health-counselling'];
+    let fallbackKey = 'health-counselling';
+    for (const [key, loc] of Object.entries(CAMPUS_LOCATIONS)) {
+      if (loc.keywords.some(kw => q.includes(kw))) {
+        fallback = loc;
+        fallbackKey = key;
+        break;
+      }
+    }
+    return res.json({
+      key:                fallbackKey,
+      label:              fallback.label,
+      address:            fallback.address,
+      isPhysicalLocation: true,
+      fallback:           true,
+    });
+  }
+});
+
+// ── /api/maps-key ─────────────────────────────────────────────────────────────
+// Serves the Google Maps API key to the frontend so it's not hardcoded in HTML.
+app.get('/api/maps-key', (req, res) => {
+  const key = process.env.GOOGLE_MAPS_API_KEY;
+  if (!key || key === 'YOUR_GOOGLE_MAPS_API_KEY_HERE') {
+    return res.status(503).json({ error: 'Google Maps API key not configured' });
+  }
+  res.json({ key });
+});
+
+// Serve frontend index at root
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+// ── /api/chat ────────────────────────────────────────────────────────────────
+// Powers the AI Accessibility Assistant chat interface
+app.post('/api/chat', async (req, res) => {
+  const { messages } = req.body;
+  console.log(`[Chat] Received request with ${messages?.length || 0} messages`);
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: 'messages array is required' });
+  }
+
+  const modelId = process.env.BEDROCK_MODEL_ID || 'amazon.nova-micro-v1:0';
+  const systemPrompt = `You are T-Care, a compassionate and knowledgeable accessibility and campus navigation assistant for the University of Toronto. Your role is to help students find the right campus resources, services, and support. Help students find specific offices, addresses, and hours. At the end of each response, if you've identified a relevant service, add a line like: RESOURCE:[service_key] where service_key is one of: health-counselling, counselling, tcard, registrar, aoda, ramp, equity, financial.`;
+
+  try {
+    const formattedMessages = messages.map(m => ({
+      role: m.role === 'ai' || m.role === 'assistant' ? 'assistant' : 'user',
+      content: [{ text: m.content }]
+    }));
+
+    // Some models don't support the 'system' array natively in ConverseCommand (e.g. Titan Text Lite).
+    // Safest cross-model approach is injecting instructions into the first user message.
+    if (formattedMessages.length > 0 && formattedMessages[0].role === 'user') {
+      formattedMessages[0].content[0].text = `[System Instructions: ${systemPrompt}]\n\nUser: ${formattedMessages[0].content[0].text}`;
+    }
+
+    const cmd = new ConverseCommand({
+      modelId,
+      messages: formattedMessages,
+      inferenceConfig: { maxTokens: 1000, temperature: 0.7 },
+    });
+
+    const bedrockRes = await bedrock.send(cmd);
+    const content = bedrockRes.output.message.content[0].text;
+
+    return res.json({ content });
+  } catch (err) {
+    console.error('Chat error:', err);
+    return res.status(500).json({ error: 'Failed to communicate with Bedrock', detail: err.message });
+  }
+});
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`T-Care backend running on http://localhost:${PORT}`);
+  console.log(`  Bedrock model : ${process.env.BEDROCK_MODEL_ID || 'amazon.nova-micro-v1:0'}`);
+  console.log(`  Kendra index  : ${process.env.KENDRA_INDEX_ID  || '(not configured)'}`);
+  console.log(`  Google Maps   : ${process.env.GOOGLE_MAPS_API_KEY ? 'configured' : 'NOT SET'}`);
+});
